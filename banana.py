@@ -3,7 +3,8 @@ import threading
 import core
 import redis
 import cStringIO
-
+import urllib
+import re
 
 #FLASK SLACK LISTENER
 app = Flask(__name__)
@@ -17,16 +18,33 @@ def slack():
 
     command = ''
     slashcheck = request.form.get("text", "")
+    slashcommand = request.form.get("command", "")
     if slashcheck[0] == '/':
         command = 'banana:: ' + slashcheck[8:]
+    elif slashcommand == '/banana':
+        command = 'banana:: ' + slashcheck
     else:
         command = slashcheck
+        format = command.split(' ')
+        command = ''
+        for token in format:
+            regex = '<(.*)\|(.*)>'
+            parser = re.match(regex,token)
+            if parser:
+                command = command + parser.group(2) + ' '
+            else:
+                command = command + token + ' '
+
+        commandlength = len(command)
+        command = command[0:commandlength-1]
+
 
     slackid = request.form.get("user_id", "")
-    print command
+    channel = request.form.get("channel_id","")
 
     r.hset('command','message',command)
     r.hset('command','gateway','slack')
+    r.hset('command','channel',channel)
     r.hset('command','sender',slackid)
     r.rpush('inQ','command')
 
@@ -47,14 +65,10 @@ def ping():
 if __name__ == "__main__":
     r = redis.StrictRedis(host='localhost',port=6379,db=0)
 
-    lock = threading.Lock()
-
-    #sendThread = core.send(r,lock)
     coreThread = core.core(r)
-    listenThread = core.listen(r,lock)
-
-    #sendThread.start()    
+    listenThread = core.listen(r)
+ 
     coreThread.start()      
     listenThread.start()  
 
-    app.run(debug=True, host = '0.0.0.0')
+    app.run(debug=True, host = '0.0.0.0', port=5555)

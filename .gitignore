@@ -66,3 +66,7 @@ docs/_build/
 
 #redis data files
 *.rdb
+
+*.cfg
+archive/
+feedback.txt

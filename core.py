@@ -45,19 +45,24 @@ class core(threading.Thread):
                 if not cfg_Flag:
                     self.createCFG(module) 
 
+
     def run(self):
         if(self.redis_conn.get('counttwo') is None):
             self.redis_conn.set('counttwo','1')
 
         while (1):
-            varvar = self.redis_conn.blpop('inQ')
-            dictionary = self.redis_conn.hgetall(varvar[1])
-            message = self.redis_conn.hget(varvar[1],'message')
-            gateway = self.redis_conn.hget(varvar[1],'gateway')
-            sender = self.redis_conn.hget(varvar[1],'sender')
+            try:
+                varvar = self.redis_conn.blpop('inQ', timeout = 0)
+                dictionary = self.redis_conn.hgetall(varvar[1])
+                message = self.redis_conn.hget(varvar[1],'message')
+                gateway = self.redis_conn.hget(varvar[1],'gateway')
+                channel = self.redis_conn.hget(varvar[1],'channel')
+                sender = self.redis_conn.hget(varvar[1],'sender')
 
-            worker = Worker(self.redis_conn,self.moduleDict,message,gateway,sender)
-            worker.start()
+                worker = Worker(self.redis_conn,self.moduleDict,message,gateway,sender,channel)
+                worker.start()
+            except:
+                print 'connection exception'
 
     def createCFG(self,module):
         config = ConfigParser.RawConfigParser()
@@ -73,13 +78,14 @@ class core(threading.Thread):
         self.moduleDict[module] = test
 
 class Worker(threading.Thread):
-    def __init__(self,r,moduleDict,message,gateway,sender):
+    def __init__(self,r,moduleDict,message,gateway,sender,channel):
         threading.Thread.__init__(self)
         self.r = r
         self.moduleDict = moduleDict
         self.message = message
         self.gateway = gateway
         self.sender = sender
+        self.channel = channel
 
     def run(self):
         tokens = self.message.split(' ')
@@ -88,7 +94,10 @@ class Worker(threading.Thread):
         if tokens[0] == "banana::":
                 
             if tokens[1] in self.moduleDict:
-                response = self.moduleDict[tokens[1]].run(self.message,self.sender)
+                response = self.moduleDict[tokens[1]].run(self.message,self.sender,self.channel)
+
+            elif tokens[1] == '-help':
+                response = 'Banana Bot Manual:\n\nhttps://docs.google.com/document/d/1MAuDd2TDEHYk9kwl8Q6MvQWfAUoOABFr29XpJkbZ5E8/edit?usp=sharing\n'
 
             else:
                 response = 'Module not found!\n'
@@ -102,74 +111,41 @@ class Worker(threading.Thread):
         self.r.hset('response:'+str(self.r.get('counttwo')),'response',response)
         self.r.hset('response:'+str(self.r.get('counttwo')),'gateway',self.gateway)
         self.r.hset('response:'+str(self.r.get('counttwo')),'sender',self.sender)
+        self.r.hset('response:'+str(self.r.get('counttwo')),'channel',self.channel)
         self.r.rpush('outQ','response:'+str(self.r.get('counttwo')))
         self.r.incr('counttwo')
-
-#################
-# SEND THREAD   #
-#################
-class send(threading.Thread):
-    def __init__(self, redis_conn,lock):
-        threading.Thread.__init__(self)
-        self.redis_conn = redis_conn
-        self.lock = lock
-    def run(self):
-        #if count is undeclared, initialize it to 1
-        if(self.redis_conn.get('count') is None):
-            self.redis_conn.set('count','1')
-        while (1):
-            #self.lock.acquire()
-            command = self.sendAction(self.redis_conn)
-            #self.lock.release()
-            if command == 'exit':
-                break
-            #time.sleep(1)
-
-
-    def sendAction(self,r):
-        message = r.blpop('mainQ')
-        command = r.hget(message[1],'text')
-        gateway = r.hget(message[1],'gateway')
-        r.hset('command:'+str(r.get('count')),'message',command)
-        r.hset('command:'+str(r.get('count')),'gateway',gateway)
-        r.rpush('inQ','command:'+str(r.get('count')))
-        r.incr('count') 
-        return command
 
 #################
 # LISTEN THREAD #
 #################
 class listen(threading.Thread):
-    def __init__(self, redis_conn,lock):
+    def __init__(self, redis_conn):
         threading.Thread.__init__(self)
         self.redis_conn = redis_conn
-        self.lock = lock
     def run(self):
         if(self.redis_conn.get('countthree') is None):
             self.redis_conn.set('countthree','1')
         while (1):
-            #self.lock.acquire()
-            response = self.listenAction(self.redis_conn)
-            #self.lock.release()
-            if response == "exit":
-                break
-            #time.sleep(1)
+            try:
+                response = self.listenAction(self.redis_conn)
+                if response == "exit":
+                    break
+            except:
+                print 'connection exception'
 
     #checks the outQ for response messages
     def listenAction(self,r):
-        varvar = r.blpop('outQ')
+        varvar = r.blpop('outQ',timeout = 0)
         response = r.hget(varvar[1],'response')
         gateway = r.hget(varvar[1],'gateway')
         sender = r.hget(varvar[1],'sender')
-        
+        channel = r.hget(varvar[1],'channel')
         if gateway == 'slack':
-            self.sendSlack(response)
+            self.sendSlack(channel,response)
 
-        print response
         return response
 
-    def sendSlack(self,response):
+    def sendSlack(self,channel,response):
 
-        postparams = {"channel": "#testingbot", "username": "banana", "text": "```" + response + "```" }
-        getparams = {"token":"PBD7gPUVByYLziBPQ4XkrjvJ"}
-        req = requests.post('https://seertech.slack.com/services/hooks/incoming-webhook?token=PBD7gPUVByYLziBPQ4XkrjvJ',params=getparams,data=json.dumps(postparams))
+        getparams = {"token": "xoxp-2315794369-2421792110-2468567197-93f2c6","channel": channel, "username": "banana", "text": "```" + response + "```" }
+        req = requests.post('https://slack.com/api/chat.postMessage',params=getparams, verify=False)

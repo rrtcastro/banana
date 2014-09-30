@@ -2,11 +2,13 @@ import elementtree.ElementTree as ET
 from basecamp import Basecamp
 import ConfigParser
 import re
+from datetime import datetime, timedelta
 import time
-from datetime import datetime
+from threading import Thread
 import requests
 import json
 import redis
+from apscheduler.scheduler import Scheduler
 
 from HTMLParser import HTMLParser
 class MessageParser(HTMLParser):
@@ -14,18 +16,11 @@ class MessageParser(HTMLParser):
 		HTMLParser.__init__(self)
 		self.output = ''
 
-	def handle_starttag(self, tag, attrs):
-		print "Encountered a start tag:", tag
-
 	def handle_endtag(self, tag):
-		print "Encountered an end tag :", tag
-
 		if tag == 'br':
 			self.output = self.output + '\n\n'
 
 	def handle_data(self, data):
-		print "Encountered some data  :", data
-
 		self.output = self.output + ' ' + data
 
 
@@ -38,6 +33,10 @@ class Bcamp:
 		self.keyword = config.get('Setup','keyword')
 
 	def cacheData(self):
+
+		getparams = {"token": "xoxp-2315794369-2421792110-2468567197-93f2c6","channel": "G02BLVCKM", "username": "banana", "text": "```Starting to update Basecamp archives```" }
+		req = requests.post('https://slack.com/api/chat.postMessage',params=getparams, verify=False)
+
 		r = redis.StrictRedis(host='localhost',port=6379,db=0)
 		bc = Basecamp('https://seertechnologies.basecamphq.com', self.api_token)
 		i = 1
@@ -51,14 +50,18 @@ class Bcamp:
 			r.hset('Users:' + item.find('email-address').text, 'id',item.find('id').text)
 			r.hset('Users:' + item.find('email-address').text, 'email',item.find('email-address').text)
 
+			r.zadd('Users', 1,item.find('id').text)
+
+			r.hset('Users:' + item.find('id').text, 'latestLog', "1970-01-01")
+			r.hset('Users:' + item.find('id').text, 'email',item.find('email-address').text)
+			
+
 		xml = bc.projects().text
 		items = ET.fromstring(xml).findall('project')
 		for item in items:
 			#all projects under seer
 			projectname = item.find('name').text
 			projectid = item.find('id').text
-			print projectname
-			print projectid
 
 			r.hset('Projects:' + projectname,"name",projectname)
 			r.hset('Projects:' + projectname,"id",projectid)
@@ -93,10 +96,16 @@ class Bcamp:
 
 					r.zadd('Time_entry:' + projectid, int(item2.find('person-id').text),timeentryid)
 
-					print i
-					i = i + 1
+					logDate = datetime(int(item2.find('date').text[0:4]), int(item2.find('date').text[5:7]), int(item2.find('date').text[8:10]))
+					dateToday = datetime.now()
+					
+					if dateToday.month==logDate.month and dateToday.year==logDate.year and dateToday.day-1==logDate.day:
+						totalLogs = float(r.hget('Users:' + item2.find('person-id').text, 'totalLogsForTheWeek'))
+						totalLogs = totalLogs + float(item2.find('hours').text)
+						r.hset('Users:' + item2.find('person-id').text, 'totalLogsForTheWeek', totalLogs)
+						r.hset('Users:' + item2.find('person-id').text, 'latestLog', item2.find('date').text)
 
-					print item2.find('description').text
+					i = i + 1
 
 				if count != 50:
 					break
@@ -192,9 +201,18 @@ class Bcamp:
 			for person in peoplesearch:
 				r.zadd("peopleperproject:" + projectid, int(person.find('id').text),person.find('email-address').text)
 
+		getparams = {'token': self.slack_token,'pretty':'1'}
+		req = requests.get('https://slack.com/api/users.list', params=getparams, verify=False)
+		userlist = json.loads(req.content)
+		for user in userlist['members']:
+			r.hset('Slack:Users:' + user['profile']['email'], 'id', user['id'])
 
 
-	def run(self,input,sender):
+		getparams = {"token": "xoxp-2315794369-2421792110-2468567197-93f2c6","channel": "G02BLVCKM", "username": "banana", "text": "```Basecamp updated!```" }
+		req = requests.post('https://slack.com/api/chat.postMessage',params=getparams, verify=False)
+
+
+	def run(self,input,sender,channel):
 		regex = '(.*)\s%s\s+(\S*)' % self.keyword
 		method_checker = re.match(regex,input)
 		response = 'default'
@@ -203,9 +221,24 @@ class Bcamp:
 			self.cacheData()
 			response = 'Updated!'
 
+		elif(method_checker.group(2) == 'Cron'):
+			""" banana: basecamp Cron"""
+			
+			sched = Scheduler()
+			
+			sched.add_cron_job(self.cacheData,hour=2,minute=0)
+
+			sched.start()
+
+			response = 'Started cron'
+
 		elif(method_checker.group(2) == 'log'):
+
+			response = 'Logging turned off'
+			return response
+
 			""" banana:: basecamp log <email> <"project name"> <hours> <"desc">"""
-			regex = '(.*)\s%s\s+log\s+(.*)\s+["|\'](.*)["|\']\s+([0-9]*[0-9]?\.+[0-9])\s+["|\'](.*)["|\']' % self.keyword
+			regex = '(.*)\s%s\s+log\s+(.*)\s+["|\'](.*)["|\']\s+([0-9]*[0-9]?\.?[0-9]+)\s+["|\'](.*)["|\']((\s+)([0-9][0-9][0-9][0-9][-][0-9][0-9][-][0-9][0-9]))?' % self.keyword
 			parser = re.match(regex,input)
 			if parser:
 				projectid = ''
@@ -221,9 +254,15 @@ class Bcamp:
 
 				hour = parser.group(4)
 				desc = parser.group(5)
-				date = int(time.strftime("%Y%m%d"))
+				date = ''
+				inputdate = parser.group(6)
+				if inputdate == "" or inputdate is None:
+					date = int(time.strftime("%Y%m%d"))
 
-				user_email = parser.group(2).split('|')[1][:-1]
+				else:
+					date = int(inputdate[1:5] + inputdate[6:8] + inputdate[9:11])
+
+				user_email = parser.group(2)
 				userid = ''
 
 				bc = Basecamp('https://seertechnologies.basecamphq.com', self.api_token)
@@ -241,9 +280,20 @@ class Bcamp:
 				projectpeople = bc.people_per_project(projectid).text
 				peoplesearch = ET.fromstring(projectpeople).findall('person')
 				for person in peoplesearch:
-					if int(person.find('id').text) == userid:
+					if person.find('id').text == userid:
 						bc.create_time_entry(desc,float(hour),int(userid),date,int(projectid),None).text
 						response = 'Logged successfully!'
+
+						totalLogs = float(r.hget('Users:' + userid, 'BananaLogsForTheWeek'))
+						totalLogs = totalLogs + float(hour)
+						r.hset('Users:' + userid, 'BananaLogsForTheWeek', totalLogs)
+
+						bananaUsage = r.hget('Users:' + userid, 'BananaUsageForTheWeek')
+						dateToday = datetime.now().weekday()
+						if dateToday == len(bananaUsage):
+							bananaUsage = bananaUsage + 'B'
+							r.hset('Users:' + userid, 'BananaUsageForTheWeek',bananaUsage)
+
 						return response
 
 				response = 'You do not belong to that project.'
@@ -251,11 +301,10 @@ class Bcamp:
 
 
 			""" banana:: basecamp log <"project name"> <hours> <"desc">"""
-			regex = '(.*)\s%s\s+log\s+["|\'](.*)["|\']\s+([0-9]*[0-9]?\.+[0-9])\s+["|\'](.*)["|\']' % self.keyword
+			regex = '(.*)\s%s\s+log\s+["|\'](.*)["|\']\s+([0-9]*[0-9]?\.?[0-9]+)\s+["|\'](.*)["|\']((\s+)([0-9][0-9][0-9][0-9][-][0-9][0-9][-][0-9][0-9]))?' % self.keyword
 			parser = re.match(regex,input)
 			
 			if parser:
-				print "log 2"
 				projectid = ''
 				projectname = parser.group(2)
 
@@ -269,10 +318,18 @@ class Bcamp:
 
 				hour = parser.group(3)
 				desc = parser.group(4)
-				date = int(time.strftime("%Y%m%d"))
+
+				date = ''
+				inputdate = parser.group(5)
+				if inputdate == "" or inputdate is None:
+					date = int(time.strftime("%Y%m%d"))
+
+				else:
+					date = int(inputdate[1:5] + inputdate[6:8] + inputdate[9:11])
+
 
 				getparams = {'token': self.slack_token,'pretty':'1'}
-				req = requests.get('https://slack.com/api/users.list', params=getparams)
+				req = requests.get('https://slack.com/api/users.list', params=getparams, verify=False)
 				userlist = json.loads(req.content)
 				user_email = ''
 				for user in userlist['members']:
@@ -292,6 +349,17 @@ class Bcamp:
 				bc = Basecamp('https://seertechnologies.basecamphq.com', self.api_token)
 				bc.create_time_entry(desc,float(hour),int(userid),date,int(projectid),None).text
 				
+				totalLogs = float(r.hget('Users:' + userid, 'BananaLogsForTheWeek'))
+				totalLogs = totalLogs + float(hour)
+				r.hset('Users:' + userid, 'BananaLogsForTheWeek', totalLogs)
+
+				bananaUsage = r.hget('Users:' + userid, 'BananaUsageForTheWeek')
+				dateToday = datetime.now().weekday()
+				if dateToday == len(bananaUsage):
+					bananaUsage = bananaUsage + 'B'
+					r.hset('Users:' + userid, 'BananaUsageForTheWeek',bananaUsage)
+
+				response = 'successfully logged!'
 				return response
 
 			else:
@@ -304,7 +372,6 @@ class Bcamp:
 			if parser:
 
 				email = parser.group(2)
-				email = email.split('|')[1][:-1]
 				projectlist = []
 
 
@@ -326,7 +393,6 @@ class Bcamp:
 					if checker != None and checker != "" and checker != []:
 						projectlist.append(projectname)
 
-				print projectlist
 				response = "Projects of %s: \n\n" % email
 				for project in projectlist:
 					response = response + project + "\n"
@@ -343,7 +409,7 @@ class Bcamp:
 				projectid = ''
 				userid = ''
 				projectname = parser.group(2)
-				email = parser.group(3).split('|')[1][:-1]
+				email = parser.group(3)
 				date1 = parser.group(4)
 				date1 = datetime(int(date1[0:4]), int(date1[5:7]), int(date1[8:10]))
 				date2 = parser.group(5)
@@ -354,8 +420,6 @@ class Bcamp:
 
 				r = redis.StrictRedis(host='localhost',port=6379,db=0)
 				userid = r.hget('Users:' + email,'id')
-
-				print userid
 
 				if userid == None or userid == "":
 					response = 'Email not found!'
@@ -395,9 +459,8 @@ class Bcamp:
 			regex = '(.*)\s%s\s+getDistribution\s+(.*)' % self.keyword
 			parser = re.match(regex,input)
 			if parser:
-				print 'getdist opening!!!'
 				userid = ''
-				email = parser.group(2).split('|')[1][:-1]
+				email = parser.group(2)
 				"""distribution = [{'name':'example','hours':'69', 'percent':100}]"""
 				distribution = []
 				projectlist = []
@@ -405,15 +468,11 @@ class Bcamp:
 				r = redis.StrictRedis(host='localhost',port=6379,db=0)
 				userid = r.hget('Users:' + email,'id')
 
-				print userid
-
 				if userid == None or userid == "":
 					response = 'Email not found!'
 					return response
 
 				projects = r.zrange('Projects',0,-1)
-				print projects
-
 
 				for project in projects:
 					projectid = r.hget('Projects:' + project,'id')
@@ -438,7 +497,7 @@ class Bcamp:
 					total_hours = total_hours + entry['hours']
 
 				for entry in distribution:
-					entry['percent'] = (float(entry['hours'])/float(total_hours)) * 100
+					entry['percent'] = round((float(entry['hours'])/float(total_hours)) * 100,2)
 
 				for entry in distribution:
 					response = response + entry['name'] + "   " + str(entry['percent']) + "\n"
@@ -538,11 +597,14 @@ class Bcamp:
 				messages = r.zrange("Message:" + projectid,0,-1)
 				for message in messages:
 					messagedata = r.hgetall("Message:" + message)
-					response = response + messagedata['body'] + '\n'
 
+					parser = MessageParser()
+					parser.feed(messagedata['body'])
 
+					response = response + parser.output + '\n'
 					response = response + "\n"
 
+					parser.close()
 
 		elif method_checker.group(2) == 'addTodoList':
 			""" banana: basecamp addTodoList <"Project Name"> <"Todo List Name">"""
@@ -568,18 +630,155 @@ class Bcamp:
 
 				response = 'Todo List created successfully'
 
-
-		elif method_checker.group(2) == 'addMessages':
-			""" banana: basecamp addMessages <"Project Name"> <"">"""
-			regex = '(.*)\s%s\s+addMessages\s+["|\'](.*)["|\']\s+["|\'](.*)["|\']' % self.keyword
+		elif method_checker.group(2) == "getDistributionLastMonth":
+			""" banana:: basecamp getDistributionLastMonth <email>"""
+			regex = '(.*)\s%s\s+getDistributionLastMonth\s+(.*)' % self.keyword
 			parser = re.match(regex,input)
+			if parser:
+				userid = ''
+				email = parser.group(2)
+				"""distribution = [{'name':'example','hours':'69', 'percent':100}]"""
+				distribution = []
+				projectlist = []
 
-			response = ''
+				r = redis.StrictRedis(host='localhost',port=6379,db=0)
+				userid = r.hget('Users:' + email,'id')
 
-			#if parser:
+				if userid == None or userid == "":
+					response = 'Email not found!'
+					return response
 
+				projects = r.zrange('Projects',0,-1)
+
+				for project in projects:
+					projectid = r.hget('Projects:' + project,'id')
+					projectname = r.hget('Projects:' + project,'name')
+
+					userposts = r.zrangebyscore("Time_entry:" + projectid,userid,userid)
+					if userposts != None and userposts != "" and userposts != []:
+
+						instance = {'name':projectname,'hours':0,'percent':100}
+
+						for userpost in userposts:
+							timedetails = r.hgetall("Time_entry:" + userpost)
+
+							entrydate = timedetails['date']
+							entrydate = datetime(int(entrydate[0:4]), int(entrydate[5:7]), int(entrydate[8:10]))
+							datetoday = datetime.now()
+
+							if (entrydate.month+1 == datetoday.month and entrydate.year == datetoday.year) or (entrydate.month == 12 and datetoday.month == 1 and entrydate.year+1 == datetoday.year):
+								instance['hours'] = instance['hours'] + float(timedetails['hours'])
+
+						distribution.append(instance)
+
+
+
+				response = "Logs of %s: \n\n" % email
+				total_hours = 0
+				for entry in distribution:
+					total_hours = total_hours + entry['hours']
+
+				for entry in distribution:
+					entry['percent'] = round((float(entry['hours'])/float(total_hours)) * 100,2)
+
+				for entry in distribution:
+					response = response + entry['name'] + "   " + str(entry['percent']) + "\n"
+
+			else:
+				response = 'Wrong set of parameters. Must be banana:: basecamp getDistributionLastMonth <email>'
+
+		elif method_checker.group(2) == "getStarbucks":
+			""" banana:: basecamp getStarbucks"""
+			regex = '(.*)\s%s\s+getStarbucks' % self.keyword
+			parser = re.match(regex,input)
+			if parser:
+
+				response = 'People who logged at least 32 hours using banana last week: \n'
+				r = redis.StrictRedis(host='localhost',port=6379,db=0)
+				users = r.zrange('Users',0,-1)
+				for user in users:
+					totalLogs = r.hget('Users:' + user, 'totalLogsLastWeek')
+					bananalogs = r.hget('Users:' + user, 'totalLogsLastWeek')
+					bananaUsage = r.hget('Users:' + user, 'totalLogsLastWeek')
+
+			else:
+				response = 'Wrong set of parameters. Must be banana:: basecamp getProjects <email>'
 
 		else:
 			response = 'Module not found!'
 
 		return response
+
+	def Cron(self):
+		r = redis.StrictRedis(host='localhost',port=6379,db=0)
+
+		t = datetime.now()
+		if t.hour >= 2:
+			t = t + timedelta(days = 1)
+		
+		target = datetime(t.year,t.month,t.day,2,0)
+		t = datetime.now()
+
+		while 1:
+
+			t += timedelta(minutes=1)
+
+			while datetime.now() > target:
+				time.sleep((t - datetime.now()).seconds)
+
+
+			if datetime.now() > target:
+				target += timedelta(days=1)
+
+
+				getparams = {"token": "xoxp-2315794369-2421792110-2468567197-93f2c6","channel": "G02BLVCKM", "username": "banana", "text": "```Starting to update Basecamp archives```" }
+				req = requests.post('https://slack.com/api/chat.postMessage',params=getparams, verify=False)
+
+				self.cacheData()
+
+				i = 1
+				users = r.zrange('Users',0,-1)
+				datecheck = datetime.now()
+
+				'''if datecheck.weekday() <= 5 and datecheck.weekday() > 0:
+
+					for user in users:
+						latestLog = r.hget("Users:" + user,'latestLog')
+						latestLog = datetime(int(latestLog[0:4]), int(latestLog[5:7]), int(latestLog[8:10]))
+						dateDiff = abs((datecheck - latestLog).days)
+						if dateDiff>1:
+							email = r.hget("Users:" + user,'email')
+							userid = r.hget("Slack:Users:" + email,'id')
+							print userid
+							if userid is not None:
+								postparams = {"channel": userid, "username": "banana", "text": "Hi, it seems you do not logged your time for yesterday. Please log it ASAP." }
+								getparams = {"token":"PBD7gPUVByYLziBPQ4XkrjvJ"}
+								#req = requests.post('https://seertech.slack.com/services/hooks/incoming-webhook?token=PBD7gPUVByYLziBPQ4XkrjvJ',params=getparams,data=json.dumps(postparams))
+								print email
+
+				elif datecheck.weekday()==0:
+
+					users = r.zrange('Users',0,-1)
+					for user in users:
+
+						r.hset('Users:' + user, 'totalLogsForTheWeek', "0")
+						r.hset('Users:' + user, 'BananaLogsForTheWeek', "0")
+						r.hset('Users:' + user, 'BananaUsageForTheWeek', "")
+
+				elif datecheck.weekday()==6:
+
+					users = r.zrange('Users',0,-1)
+					for user in users:
+
+						totalLogs = r.hget('Users:' + user, 'totalLogsForTheWeek')
+						bananalogs = r.hget('Users:' + user, 'BananaLogsForTheWeek')
+						bananausage = r.hget('Users:' + user, 'BananaUsageForTheWeek')
+
+						r.hset('Users:' + user, 'totalLogsLastWeek', totalLogs)
+						r.hset('Users:' + user, 'BananaLogsLastWeek', bananalogs)
+						r.hset('Users:' + user, 'BananaUsageForLastWeek', bananausage)'''
+
+				time.sleep(30)
+
+				getparams = {"token": "xoxp-2315794369-2421792110-2468567197-93f2c6","channel": "G02BLVCKM", "username": "banana", "text": "```Basecamp updated!```" }
+	        	req = requests.post('https://slack.com/api/chat.postMessage',params=getparams, verify=False)
